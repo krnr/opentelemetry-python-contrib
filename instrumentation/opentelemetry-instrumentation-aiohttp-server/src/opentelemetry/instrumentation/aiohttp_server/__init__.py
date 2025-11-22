@@ -161,29 +161,45 @@ from opentelemetry.instrumentation.aiohttp_server.package import _instruments
 from opentelemetry.instrumentation.aiohttp_server.version import __version__
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.utils import (
-    http_status_to_status_code,
     is_http_instrumentation_enabled,
+)
+from opentelemetry.instrumentation._semconv import (
+    HTTP_DURATION_HISTOGRAM_BUCKETS_NEW,
+    _filter_semconv_active_request_count_attr,
+    _filter_semconv_duration_attrs,
+    _get_schema_url,
+    _OpenTelemetrySemanticConventionStability,
+    _OpenTelemetryStabilitySignalType,
+    _report_new,
+    _report_old,
+    _server_active_requests_count_attrs_new,
+    _server_active_requests_count_attrs_old,
+    _server_duration_attrs_new,
+    _server_duration_attrs_old,
+    _set_http_flavor_version,
+    _set_http_host_server,
+    _set_http_method,
+    _set_http_net_host_port,
+    _set_http_scheme,
+    _set_http_target,
+    _set_http_url,
+    _set_http_user_agent,
+    _set_status,
+    _StabilityMode,
 )
 from opentelemetry.propagate import extract
 from opentelemetry.propagators.textmap import Getter
 from opentelemetry.semconv._incubating.attributes.http_attributes import (
-    HTTP_FLAVOR,
-    HTTP_HOST,
-    HTTP_METHOD,
     HTTP_ROUTE,
-    HTTP_SCHEME,
     HTTP_SERVER_NAME,
-    HTTP_STATUS_CODE,
-    HTTP_TARGET,
-    HTTP_URL,
-    HTTP_USER_AGENT,
 )
-from opentelemetry.semconv._incubating.attributes.net_attributes import (
-    NET_HOST_NAME,
-    NET_HOST_PORT,
+from opentelemetry.semconv._incubating.metrics.http_metrics import (
+    create_http_server_active_requests,
 )
 from opentelemetry.semconv.metrics import MetricInstruments
-from opentelemetry.trace.status import Status, StatusCode
+from opentelemetry.semconv.metrics.http_metrics import (
+    HTTP_SERVER_REQUEST_DURATION,
+)
 from opentelemetry.util.http import (
     OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_SANITIZE_FIELDS,
     OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_SERVER_REQUEST,
@@ -194,47 +210,35 @@ from opentelemetry.util.http import (
     normalise_request_header_name,
     normalise_response_header_name,
     redact_url,
+    sanitize_method,
 )
 
-_duration_attrs = [
-    HTTP_METHOD,
-    HTTP_HOST,
-    HTTP_SCHEME,
-    HTTP_STATUS_CODE,
-    HTTP_FLAVOR,
-    HTTP_SERVER_NAME,
-    NET_HOST_NAME,
-    NET_HOST_PORT,
-    HTTP_ROUTE,
-]
-
-_active_requests_count_attrs = [
-    HTTP_METHOD,
-    HTTP_HOST,
-    HTTP_SCHEME,
-    HTTP_FLAVOR,
-    HTTP_SERVER_NAME,
-]
 
 tracer = None
 meter = None
 _excluded_urls = None
 
 
-def _parse_duration_attrs(req_attrs):
-    duration_attrs = {}
-    for attr_key in _duration_attrs:
-        if req_attrs.get(attr_key) is not None:
-            duration_attrs[attr_key] = req_attrs[attr_key]
-    return duration_attrs
+def _parse_duration_attrs(
+    req_attrs, sem_conv_opt_in_mode=_StabilityMode.DEFAULT
+):
+    return _filter_semconv_duration_attrs(
+        req_attrs,
+        _server_duration_attrs_old,
+        _server_duration_attrs_new,
+        sem_conv_opt_in_mode,
+    )
 
 
-def _parse_active_request_count_attrs(req_attrs):
-    active_requests_count_attrs = {}
-    for attr_key in _active_requests_count_attrs:
-        if req_attrs.get(attr_key) is not None:
-            active_requests_count_attrs[attr_key] = req_attrs[attr_key]
-    return active_requests_count_attrs
+def _parse_active_request_count_attrs(
+    req_attrs, sem_conv_opt_in_mode=_StabilityMode.DEFAULT
+):
+    return _filter_semconv_active_request_count_attr(
+        req_attrs,
+        _server_active_requests_count_attrs_old,
+        _server_active_requests_count_attrs_new,
+        sem_conv_opt_in_mode,
+    )
 
 
 def get_default_span_name(request: web.Request) -> str:
@@ -269,44 +273,67 @@ def _get_view_func(request: web.Request) -> str:
         return "unknown"
 
 
-def collect_request_attributes(request: web.Request) -> dict:
-    """Collects HTTP request attributes from the ASGI scope and returns a
-    dictionary to be used as span creation attributes."""
-
-    server_host, port, http_url = (
-        request.url.host,
-        request.url.port,
-        str(request.url),
-    )
-
+def _get_http_url(request: web.Request):
     query_string = request.query_string
+    http_url = str(request.url)
     if query_string and http_url:
         if isinstance(query_string, bytes):
             query_string = query_string.decode("utf8")
         http_url += "?" + urllib.parse.unquote(query_string)
+    return redact_url(http_url)
 
-    result = {
-        HTTP_SCHEME: request.scheme,
-        HTTP_HOST: server_host,
-        NET_HOST_PORT: port,
-        HTTP_ROUTE: _get_view_func(request),
-        HTTP_FLAVOR: f"{request.version.major}.{request.version.minor}",
-        HTTP_TARGET: request.path,
-        HTTP_URL: redact_url(http_url),
-    }
+
+def collect_request_attributes(
+    request: web.Request, sem_conv_opt_in_mode=_StabilityMode.DEFAULT
+) -> dict:
+    """Collects HTTP request attributes from the ASGI scope and returns a
+    dictionary to be used as span creation attributes."""
+
+    server_host, port = (
+        request.url.host,
+        request.url.port,
+    )
 
     http_method = request.method
-    if http_method:
-        result[HTTP_METHOD] = http_method
-
-    http_host_value_list = (
-        [request.host] if not isinstance(request.host, list) else request.host
-    )
-    if http_host_value_list:
-        result[HTTP_SERVER_NAME] = ",".join(http_host_value_list)
+    http_url = _get_http_url(request)
+    flavor = f"{request.version.major}.{request.version.minor}"
     http_user_agent = request.headers.get("user-agent")
+
+    result = {}
+
+    _set_http_scheme(result, request.scheme, sem_conv_opt_in_mode)
+    _set_http_host_server(result, server_host, sem_conv_opt_in_mode)
+    _set_http_net_host_port(result, port, sem_conv_opt_in_mode)
+    _set_http_flavor_version(result, flavor, sem_conv_opt_in_mode)
+    _set_http_target(
+        result,
+        request.path,
+        request.path,
+        request.query_string,
+        sem_conv_opt_in_mode,
+    )
+
+    if http_method:
+        _set_http_method(
+            result,
+            http_method,
+            sanitize_method(http_method),
+            sem_conv_opt_in_mode,
+        )
     if http_user_agent:
-        result[HTTP_USER_AGENT] = http_user_agent
+        _set_http_user_agent(result, http_user_agent, sem_conv_opt_in_mode)
+
+    if _report_old(sem_conv_opt_in_mode):
+        _set_http_url(result, http_url, _StabilityMode.DEFAULT)
+        result[HTTP_ROUTE] = _get_view_func(request)
+
+        http_host_value_list = (
+            [request.host]
+            if not isinstance(request.host, list)
+            else request.host
+        )
+        if http_host_value_list:
+            result[HTTP_SERVER_NAME] = ",".join(http_host_value_list)
 
     # remove None values
     result = {k: v for k, v in result.items() if v is not None}
@@ -350,23 +377,27 @@ def collect_response_headers_attributes(
     )
 
 
-def set_status_code(span, status_code: int) -> None:
+def set_status_code(
+    span,
+    status_code: int,
+    sem_conv_opt_in_mode=_StabilityMode.DEFAULT,
+) -> None:
     """Adds HTTP response attributes to span using the status_code argument."""
+    status_code_str = str(status_code)
 
     try:
         status_code = int(status_code)
     except ValueError:
-        span.set_status(
-            Status(
-                StatusCode.ERROR,
-                "Non-integer HTTP status: " + repr(status_code),
-            )
-        )
-    else:
-        span.set_attribute(HTTP_STATUS_CODE, status_code)
-        span.set_status(
-            Status(http_status_to_status_code(status_code, server_span=True))
-        )
+        status_code = -1
+
+    _set_status(
+        span,
+        {},
+        status_code,
+        status_code_str,
+        server_span=True,
+        sem_conv_opt_in_mode=sem_conv_opt_in_mode,
+    )
 
 
 class AiohttpGetter(Getter):
@@ -395,63 +426,118 @@ class AiohttpGetter(Getter):
 getter = AiohttpGetter()
 
 
-@web.middleware
-async def middleware(request, handler):
-    """Middleware for aiohttp implementing tracing logic"""
-    if not is_http_instrumentation_enabled() or _excluded_urls.url_disabled(
-        request.url.path
-    ):
-        return await handler(request)
+def create_duraton_histogram_old(sem_conv_opt_in_mode):
+    if _report_old(sem_conv_opt_in_mode):
+        return meter.create_histogram(
+            name=MetricInstruments.HTTP_SERVER_DURATION,
+            unit="ms",
+            description="Measures the duration of inbound HTTP requests.",
+        )
 
-    span_name = get_default_span_name(request)
 
-    request_attrs = collect_request_attributes(request)
-    duration_attrs = _parse_duration_attrs(request_attrs)
-    active_requests_count_attrs = _parse_active_request_count_attrs(
-        request_attrs
+def create_duraton_histogram_new(sem_conv_opt_in_mode):
+    if _report_new(sem_conv_opt_in_mode):
+        return meter.create_histogram(
+            name=HTTP_SERVER_REQUEST_DURATION,
+            unit="s",
+            description="Duration of HTTP server requests.",
+            explicit_bucket_boundaries_advisory=HTTP_DURATION_HISTOGRAM_BUCKETS_NEW,
+        )
+
+
+def otel_middleware(**kwargs):
+    _OpenTelemetrySemanticConventionStability._initialize()
+    sem_conv_opt_in_mode = _OpenTelemetrySemanticConventionStability._get_opentelemetry_stability_opt_in_mode(
+        _OpenTelemetryStabilitySignalType.HTTP,
+    )
+    # update global values at instrument time so we can test them
+    global _excluded_urls  # pylint: disable=global-statement
+    _excluded_urls = get_excluded_urls("AIOHTTP_SERVER")
+
+    global tracer  # pylint: disable=global-statement
+    tracer = trace.get_tracer(
+        __name__,
+        __version__,
+        kwargs.get("tracer_provider", None),
+        schema_url=_get_schema_url(sem_conv_opt_in_mode),
     )
 
-    duration_histogram = meter.create_histogram(
-        name=MetricInstruments.HTTP_SERVER_DURATION,
-        unit="ms",
-        description="Measures the duration of inbound HTTP requests.",
+    global meter  # pylint: disable=global-statement
+    meter = metrics.get_meter(
+        __name__,
+        __version__,
+        kwargs.get("meter_provider", None),
+        schema_url=_get_schema_url(sem_conv_opt_in_mode),
     )
 
-    active_requests_counter = meter.create_up_down_counter(
-        name=MetricInstruments.HTTP_SERVER_ACTIVE_REQUESTS,
-        unit="requests",
-        description="measures the number of concurrent HTTP requests those are currently in flight",
-    )
+    @web.middleware
+    async def middleware(request, handler):
+        """Middleware for aiohttp implementing tracing logic"""
+        if (
+            not is_http_instrumentation_enabled()
+            or _excluded_urls.url_disabled(request.url.path)
+        ):
+            return await handler(request)
 
-    with tracer.start_as_current_span(
-        span_name,
-        context=extract(request, getter=getter),
-        kind=trace.SpanKind.SERVER,
-    ) as span:
-        if span.is_recording():
-            request_headers_attributes = collect_request_headers_attributes(
-                request
-            )
-            request_attrs.update(request_headers_attributes)
-            span.set_attributes(request_attrs)
-        start = default_timer()
-        active_requests_counter.add(1, active_requests_count_attrs)
-        try:
-            resp = await handler(request)
-            set_status_code(span, resp.status)
+        span_name = get_default_span_name(request)
+
+        request_attrs = collect_request_attributes(
+            request, sem_conv_opt_in_mode
+        )
+        duration_attrs = _parse_duration_attrs(
+            request_attrs, sem_conv_opt_in_mode
+        )
+        active_requests_count_attrs = _parse_active_request_count_attrs(
+            request_attrs, sem_conv_opt_in_mode
+        )
+
+        duration_histogram_old = create_duraton_histogram_old(
+            sem_conv_opt_in_mode
+        )
+        duration_histogram_new = create_duraton_histogram_new(
+            sem_conv_opt_in_mode
+        )
+
+        active_requests_counter = create_http_server_active_requests(meter)
+
+        with tracer.start_as_current_span(
+            span_name,
+            context=extract(request, getter=getter),
+            kind=trace.SpanKind.SERVER,
+        ) as span:
             if span.is_recording():
-                response_headers_attributes = (
-                    collect_response_headers_attributes(resp)
+                request_headers_attributes = (
+                    collect_request_headers_attributes(request)
                 )
-                span.set_attributes(response_headers_attributes)
-        except web.HTTPException as ex:
-            set_status_code(span, ex.status_code)
-            raise
-        finally:
-            duration = max((default_timer() - start) * 1000, 0)
-            duration_histogram.record(duration, duration_attrs)
-            active_requests_counter.add(-1, active_requests_count_attrs)
-        return resp
+                request_attrs.update(request_headers_attributes)
+                span.set_attributes(request_attrs)
+            start = default_timer()
+            active_requests_counter.add(1, active_requests_count_attrs)
+            try:
+                resp = await handler(request)
+                set_status_code(span, resp.status, sem_conv_opt_in_mode)
+                if span.is_recording():
+                    response_headers_attributes = (
+                        collect_response_headers_attributes(resp)
+                    )
+                    span.set_attributes(response_headers_attributes)
+            except web.HTTPException as ex:
+                set_status_code(span, ex.status_code, sem_conv_opt_in_mode)
+                raise
+            finally:
+                duration_s = default_timer() - start
+                if duration_histogram_old:
+                    duration_histogram_old.record(
+                        max(duration_s * 1000, 0), duration_attrs
+                    )
+                if duration_histogram_new:
+                    duration_histogram_new.record(
+                        max(duration_s, 0), duration_attrs
+                    )
+                active_requests_counter.add(-1, active_requests_count_attrs)
+            return resp
+
+    return middleware
 
 
 class _InstrumentedApplication(web.Application):
@@ -459,7 +545,7 @@ class _InstrumentedApplication(web.Application):
 
     def __init__(self, *args, **kwargs):
         middlewares = kwargs.pop("middlewares", [])
-        middlewares.insert(0, middleware)
+        middlewares.insert(0, otel_middleware(**kwargs))
         kwargs["middlewares"] = middlewares
         super().__init__(*args, **kwargs)
 
@@ -472,16 +558,6 @@ class AioHttpServerInstrumentor(BaseInstrumentor):
     """
 
     def _instrument(self, **kwargs):
-        # update global values at instrument time so we can test them
-        global _excluded_urls  # pylint: disable=global-statement
-        _excluded_urls = get_excluded_urls("AIOHTTP_SERVER")
-
-        global tracer  # pylint: disable=global-statement
-        tracer = trace.get_tracer(__name__)
-
-        global meter  # pylint: disable=global-statement
-        meter = metrics.get_meter(__name__, __version__)
-
         self._original_app = web.Application
         setattr(web, "Application", _InstrumentedApplication)
 
